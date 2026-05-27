@@ -59,6 +59,12 @@ defmodule PRuntime.Log do
 
   defp format({:announce, from, event}), do: kv(type: :announce, from: from, event: event)
 
+  defp format({:unhandled, machine, state, event}),
+    do: kv(type: :unhandled, machine: machine, state: state, event: event)
+
+  defp format({:crash, machine, state, reason}),
+    do: kv(type: :crash, machine: machine, state: state, reason: inspect(reason))
+
   defp format(other), do: kv(type: :unknown, data: inspect(other))
 
   defp kv(pairs), do: Enum.map_join(pairs, " ", fn {k, v} -> "#{k}=#{value(v)}" end)

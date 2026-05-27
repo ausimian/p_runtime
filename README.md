@@ -22,10 +22,13 @@ C# runtime logs as a side effect of base-class operations.
 
 ## Status
 
-Through M5: machine creation, state entry, `goto`, `raise halt`, payloads/types, cross-machine
-sends (`new` + registry), defer/ignore, non-halt `raise`, and spec monitors with synchronous
-`announce`/`send` fan-out plus a PObserve-compatible `key=value` log shape. Foreign types/functions
-(M6) and `any` + a Hex release (M7) arrive in later milestones.
+Through M7: machine creation, state entry, `goto`, `raise halt`, payloads/types (including `any`),
+cross-machine sends (`new` + registry), defer/ignore, non-halt `raise`, spec monitors with
+synchronous `announce`/`send` fan-out plus a PObserve-compatible `key=value` log shape, and faithful
+failure surfacing — an unhandled event raises `PRuntime.UnhandledEvent` (rather than being dropped)
+and an abnormal process crash is recorded/logged via `terminated/3`. Foreign types/functions (M6)
+run entirely in the host's `PForeign` module. A Hex release is deferred; depend on this library via
+its GitHub ref for now.
 
 ## Usage
 

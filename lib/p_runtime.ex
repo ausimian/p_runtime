@@ -21,7 +21,11 @@ defmodule PRuntime do
   — see `PRuntime.Specs`. Monitoring is opt-in via the `:p_runtime, :monitoring` flag (default
   off): when off, the fan-out short-circuits and sends cost nothing extra, so a production
   deployment runs the same machines without paying for spec delivery. Trace entries are also
-  emitted as structured log lines (`PRuntime.Log`).
+  emitted as structured log lines (`PRuntime.Log`). M7 surfaces failures faithfully: an event a
+  state cannot handle goes through `unhandled_event/3` (records + logs + raises
+  `PRuntime.UnhandledEvent`, mirroring P's abort) instead of being silently dropped, and a
+  machine's `terminate/3` calls `terminated/3` so an abnormal crash is recorded/logged with context
+  rather than vanishing into a bare `:gen_statem` report.
   """
 
   alias PRuntime.Trace
@@ -71,6 +75,46 @@ defmodule PRuntime do
   @doc "Record that `machine` dequeued `event` while in `state`."
   @spec dequeued(machine(), atom(), atom()) :: :ok
   def dequeued(machine, state, event), do: Trace.record({:dequeue, machine, state, event})
+
+  @doc """
+  Report an event `machine` received but cannot handle in `state`.
+
+  P aborts a machine that dequeues an event with no handler/`defer`/`ignore` in the current state.
+  The generated `handle_event/4` catch-all routes such a P event here (stray non-P messages are
+  ignored, not funnelled here). The unhandled event is recorded to the trace and logged at `:error`
+  *before* raising `PRuntime.UnhandledEvent`, so it is visible even if the raise is later swallowed.
+  Never returns.
+  """
+  @spec unhandled_event(machine(), atom(), atom()) :: no_return()
+  def unhandled_event(machine, state, event) do
+    Trace.record({:unhandled, machine, state, event})
+    require Logger
+    Logger.error("P machine #{inspect(machine)} received unhandled event #{inspect(event)} in state #{inspect(state)}")
+    raise PRuntime.UnhandledEvent, machine: machine, state: state, event: event
+  end
+
+  @doc """
+  Surface a machine/spec process terminating, called from the generated `terminate/3` callback.
+
+  A clean stop is silent: a normal `raise halt` is already traced by `halt/3`, `:shutdown` is the
+  supervisor stopping the tree, and a `PRuntime.SafetyViolation`/`PRuntime.UnhandledEvent` was
+  already recorded and logged at its source. Any *other* reason is an abnormal crash — recorded to
+  the trace as `{:crash, machine, state, reason}` and logged at `:error` with the machine and state,
+  so a crash is legible context rather than a bare `:gen_statem` report. Per DESIGN.md Open
+  Question 3, an abnormal crash is surfaced (not silently respawned); machines do not restart.
+  """
+  @spec terminated(machine(), atom(), term()) :: :ok
+  def terminated(_machine, _state, reason) when reason in [:normal, :shutdown], do: :ok
+  def terminated(_machine, _state, {:shutdown, _}), do: :ok
+  def terminated(_machine, _state, {%PRuntime.SafetyViolation{}, _stack}), do: :ok
+  def terminated(_machine, _state, {%PRuntime.UnhandledEvent{}, _stack}), do: :ok
+
+  def terminated(machine, state, reason) do
+    Trace.record({:crash, machine, state, reason})
+    require Logger
+    Logger.error("P machine #{inspect(machine)} crashed in state #{inspect(state)}: #{inspect(reason)}")
+    :ok
+  end
 
   @doc """
   Check a P `assert`: succeed if `condition` holds, otherwise raise a `PRuntime.SafetyViolation`.
