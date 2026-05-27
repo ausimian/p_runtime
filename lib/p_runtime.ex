@@ -14,7 +14,9 @@ defmodule PRuntime do
   M1–M2: machine creation, state entry, dequeue, `goto` (with entry payload), `raise halt`,
   and a `send`/cast wrapper. M3 adds dynamic creation (`new`, via `PRuntime.create/3` and the
   `PRuntime.Spawner`) and resolves cross-machine sends through the registry by opaque id.
-  Specs/announce and the full PObserve log shape arrive in later milestones.
+  M4 adds the queue manipulations: `defer` (`:postpone`), `ignore`, and non-halt `raise`
+  (front-of-queue re-delivery). Specs/announce and the full PObserve log shape arrive in
+  later milestones.
   """
 
   alias PRuntime.Trace
@@ -92,6 +94,46 @@ defmodule PRuntime do
   def halt(machine, state, data) do
     Trace.record({:halt, machine, state})
     {:stop, :normal, data}
+  end
+
+  @doc """
+  Build the `:gen_statem` return for `raise event` (a non-halt raise).
+
+  P's `raise E, payload` stops the current handler and processes `E` *ahead of* any further
+  queued events, in the current state. Encoded as an `:internal` `:next_event` queued at the
+  front, so the raised event is handled before pending casts. The generated `on E` clauses
+  match the event content regardless of arrival type, so the same clause services both a sent
+  and a raised `E`. `data` is the machine struct as mutated by the handler up to the raise.
+  """
+  @spec raise_event(machine(), atom(), atom(), term(), term()) :: tuple()
+  def raise_event(machine, state, event, payload, data) do
+    Trace.record({:raise, machine, state, event})
+    {:keep_state, data, [{:next_event, :internal, {:p_event, event, payload}}]}
+  end
+
+  @doc """
+  Build the `:gen_statem` return for a state that *defers* `event`.
+
+  P's `defer E` holds the event in the queue to be re-delivered after the next state change.
+  Maps to `:gen_statem`'s `:postpone` action, which retries the event (in arrival order, at
+  the front of the queue) once the state changes — matching P's deferral semantics.
+  """
+  @spec defer(machine(), atom(), atom()) :: tuple()
+  def defer(machine, state, event) do
+    Trace.record({:defer, machine, state, event})
+    {:keep_state_and_data, [:postpone]}
+  end
+
+  @doc """
+  Build the `:gen_statem` return for a state that *ignores* `event`.
+
+  P's `ignore E` dequeues the event and discards it with no effect, leaving the state and data
+  unchanged.
+  """
+  @spec ignore(machine(), atom(), atom()) :: :keep_state_and_data
+  def ignore(machine, state, event) do
+    Trace.record({:ignore, machine, state, event})
+    :keep_state_and_data
   end
 
   # ---- send ----
