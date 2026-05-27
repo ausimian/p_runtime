@@ -38,16 +38,17 @@ defmodule PRuntime do
   # ---- transitions: build the :gen_statem return AND log it ----
 
   @doc """
-  Build the `:gen_statem` return for `goto target`.
+  Build the `:gen_statem` return for `goto target` (optionally carrying a `payload`).
 
-  Transitions to `target` and queues the synthetic `:__entry__` internal event so the
-  target's entry handler runs *in the new state*, preserving P's entry-runs-on-arrival
-  semantics across every transition.
+  Transitions to `target` and queues the synthetic `{:__entry__, payload}` internal event so the
+  target's entry handler runs *in the new state* and receives the goto payload, preserving P's
+  entry-runs-on-arrival semantics across every transition. `payload` is `nil` for a payload-less
+  `goto`.
   """
-  @spec goto(machine(), atom(), atom(), term()) :: tuple()
-  def goto(machine, from, target, data) do
+  @spec goto(machine(), atom(), atom(), term(), term()) :: tuple()
+  def goto(machine, from, target, data, payload \\ nil) do
     Trace.record({:goto, machine, from, target})
-    {:next_state, target, data, [{:next_event, :internal, :__entry__}]}
+    {:next_state, target, data, [{:next_event, :internal, {:__entry__, payload}}]}
   end
 
   @doc """
