@@ -9,23 +9,43 @@ defmodule PRuntime do
   This mirrors how PChecker works: generated machine modules call these helpers, and
   logging happens here as a side effect — never inline in generated code. See DESIGN.md.
 
-  ## M1 scope
+  ## Scope so far
 
-  Only the pieces the M1 walking skeleton needs: machine creation, state entry, dequeue,
-  `goto`, `raise halt`, and a `send`/cast wrapper. Payloads, specs/announce, and the full
-  PObserve log shape arrive in later milestones.
+  M1–M2: machine creation, state entry, dequeue, `goto` (with entry payload), `raise halt`,
+  and a `send`/cast wrapper. M3 adds dynamic creation (`new`, via `PRuntime.create/3` and the
+  `PRuntime.Spawner`) and resolves cross-machine sends through the registry by opaque id.
+  Specs/announce and the full PObserve log shape arrive in later milestones.
   """
 
   alias PRuntime.Trace
 
-  @typedoc "A P machine's identity in the trace (its P name)."
-  @type machine :: String.t()
+  @typedoc """
+  A P machine's identity: an opaque id allocated when the machine is created.
+
+  Today it is a `String.t()` (the machine's registry key, e.g. `"Pinger"` or `"Pinger:1"`),
+  but generated code must treat it as opaque so a later distributed form (`{node, id}`)
+  stays non-breaking — see DESIGN.md Open Question 5. Machines are addressed by this id, not
+  by pid, so identity is stable across the (transient) process lifetime.
+  """
+  @type machine :: term()
 
   # ---- lifecycle / logging (side-effecting calls from generated code) ----
 
   @doc "Record that `machine` was created."
   @spec created(machine()) :: :ok
   def created(machine), do: Trace.record({:create, machine})
+
+  # ---- creation (P `new MachineName(args)`) ----
+
+  @doc """
+  Create machine `module` (P base name `name`) carrying entry payload `args`; returns its id.
+
+  Routed through `PRuntime.Spawner` so id allocation is serialized and race-free, and so the
+  child is started under the program's `DynamicSupervisor`. The call blocks until the new
+  machine's `init` has run (and registered), so the returned id is immediately addressable.
+  """
+  @spec create(module(), String.t(), term()) :: machine()
+  def create(module, name, args), do: PRuntime.Spawner.create(module, name, args)
 
   @doc "Record that `machine` entered `state`."
   @spec entered(machine(), atom()) :: :ok
@@ -44,11 +64,22 @@ defmodule PRuntime do
   target's entry handler runs *in the new state* and receives the goto payload, preserving P's
   entry-runs-on-arrival semantics across every transition. `payload` is `nil` for a payload-less
   `goto`.
+
+  A `goto` to the *current* state is a real re-entry in P (exit then entry run again), but
+  `:gen_statem` treats `{:next_state, S, _}` with `S` unchanged as "no state change" and skips the
+  `state_enter` callback. We therefore use `:repeat_state` for a self-transition, which re-runs
+  `state_enter` (so the entry is observed) while still processing the queued `{:__entry__}` event.
   """
   @spec goto(machine(), atom(), atom(), term(), term()) :: tuple()
   def goto(machine, from, target, data, payload \\ nil) do
     Trace.record({:goto, machine, from, target})
-    {:next_state, target, data, [{:next_event, :internal, {:__entry__, payload}}]}
+    enter = {:next_event, :internal, {:__entry__, payload}}
+
+    if from == target do
+      {:repeat_state, data, [enter]}
+    else
+      {:next_state, target, data, [enter]}
+    end
   end
 
   @doc """
@@ -68,23 +99,34 @@ defmodule PRuntime do
   @doc """
   Send event `name` (with optional `payload`) to `target`.
 
-  Async cast, matching P's non-blocking `send`. If the target process is dead (halted),
-  the cast is dropped and a `:send_to_halted` entry is logged instead — mirroring the
-  C# runtime, where enqueue to a halted machine returns `Dropped`.
+  `target` is an opaque machine id (resolved to a pid via the registry) or, for test
+  harnesses, a raw pid. Async cast, matching P's non-blocking `send`. If the target has
+  halted — its id is no longer registered, or its pid is dead — the cast is dropped and a
+  `:send_to_halted` entry is logged instead, mirroring the C# runtime, where enqueue to a
+  halted machine returns `Dropped`.
   """
-  @spec send_event(machine(), :gen_statem.server_ref(), atom(), term()) :: :ok
+  @spec send_event(machine(), machine() | pid(), atom(), term()) :: :ok
   def send_event(from, target, name, payload \\ nil) do
     Trace.record({:send, from, target, name})
 
-    if alive?(target) do
-      :gen_statem.cast(target, {:p_event, name, payload})
-    else
-      Trace.record({:send_to_halted, from, target, name})
+    case resolve(target) do
+      {:ok, pid} -> :gen_statem.cast(pid, {:p_event, name, payload})
+      :halted -> Trace.record({:send_to_halted, from, target, name})
     end
 
     :ok
   end
 
-  defp alive?(pid) when is_pid(pid), do: Process.alive?(pid)
-  defp alive?(_other), do: true
+  # Resolve a send target to a live pid. A pid is used directly (test harnesses pass pids);
+  # any other term is treated as a registry id. Either way a dead/unregistered target yields
+  # :halted so the send is dropped rather than crashing the sender.
+  @spec resolve(machine() | pid()) :: {:ok, pid()} | :halted
+  defp resolve(pid) when is_pid(pid), do: if(Process.alive?(pid), do: {:ok, pid}, else: :halted)
+
+  defp resolve(id) do
+    case Registry.lookup(PRuntime.Registry, id) do
+      [{pid, _}] -> {:ok, pid}
+      [] -> :halted
+    end
+  end
 end
