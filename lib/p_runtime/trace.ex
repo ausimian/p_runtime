@@ -14,9 +14,15 @@ defmodule PRuntime.Trace do
     Agent.start_link(fn -> [] end, name: __MODULE__)
   end
 
-  @doc "Append an entry to the trace."
+  @doc """
+  Append an entry to the trace.
+
+  Also emitted as a structured `key=value` log line via `PRuntime.Log`, so this is the single
+  funnel for both the in-memory trace tests assert on and the runtime's PObserve-friendly logging.
+  """
   @spec record(term()) :: :ok
   def record(entry) do
+    PRuntime.Log.emit(entry)
     Agent.update(__MODULE__, fn entries -> [entry | entries] end)
   end
 

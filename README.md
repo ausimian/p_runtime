@@ -10,17 +10,22 @@ library carries the cross-cutting pieces that do **not** vary with the `.p` sour
 - **Registry** — addresses machines by their P name rather than pid.
 - **Trace** — an in-memory, ordered recorder of runtime events, used by tests to assert a
   program's observable event trace.
-- **`PRuntime` helpers** — `goto`/`halt` build the `:gen_statem` return tuples, `send_event`
-  is the (halt-aware) async send wrapper, and `created`/`entered`/`dequeued` record the trace.
+- **Spawner** — serializes `new MachineName(args)` so id allocation is race-free.
+- **Specs** — the spec-monitor subscription table and the synchronous fan-out of observed events.
+- **Log** — emits each trace entry as a structured, PObserve-friendly `key=value` line.
+- **`PRuntime` helpers** — `goto`/`halt`/`raise_event`/`defer`/`ignore` build the `:gen_statem`
+  return tuples, `send_event`/`announce` are the (halt-aware, spec-fan-out) delivery wrappers, and
+  `created`/`entered`/`dequeued`/`observes` record the trace and register monitors.
 
 Logging is a runtime concern here, never inline in generated code — mirroring how PChecker's
 C# runtime logs as a side effect of base-class operations.
 
 ## Status
 
-Early (M1, the "walking skeleton"): machine creation, state entry, `goto`, `raise halt`, and
-a `send` wrapper. Payloads/types, cross-machine sends, defer/ignore, and specs/announce arrive
-in later milestones, along with a PObserve-compatible log shape.
+Through M5: machine creation, state entry, `goto`, `raise halt`, payloads/types, cross-machine
+sends (`new` + registry), defer/ignore, non-halt `raise`, and spec monitors with synchronous
+`announce`/`send` fan-out plus a PObserve-compatible `key=value` log shape. Foreign types/functions
+(M6) and `any` + a Hex release (M7) arrive in later milestones.
 
 ## Usage
 
@@ -32,7 +37,7 @@ def deps do
 end
 ```
 
-The library starts its own supervision tree (Registry + Trace) on boot.
+The library starts its own supervision tree (Registry + Trace + Specs + Spawner) on boot.
 
 ## Development
 

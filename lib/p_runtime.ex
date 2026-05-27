@@ -15,8 +15,13 @@ defmodule PRuntime do
   and a `send`/cast wrapper. M3 adds dynamic creation (`new`, via `PRuntime.create/3` and the
   `PRuntime.Spawner`) and resolves cross-machine sends through the registry by opaque id.
   M4 adds the queue manipulations: `defer` (`:postpone`), `ignore`, and non-halt `raise`
-  (front-of-queue re-delivery). Specs/announce and the full PObserve log shape arrive in
-  later milestones.
+  (front-of-queue re-delivery). M5 adds spec monitors: each `spec` is a separate `:gen_statem`
+  that registers its observed events via `observes/2`, and the synchronous fan-out (`announce/3`
+  and the fan-out built into `send_event/4`) mirrors observed events to those specs at send time
+  — see `PRuntime.Specs`. Monitoring is opt-in via the `:p_runtime, :monitoring` flag (default
+  off): when off, the fan-out short-circuits and sends cost nothing extra, so a production
+  deployment runs the same machines without paying for spec delivery. Trace entries are also
+  emitted as structured log lines (`PRuntime.Log`).
   """
 
   alias PRuntime.Trace
@@ -37,6 +42,16 @@ defmodule PRuntime do
   @spec created(machine()) :: :ok
   def created(machine), do: Trace.record({:create, machine})
 
+  @doc """
+  Register that spec `spec_id` observes `events`.
+
+  Called from a spec's `init` (specs are passive `:gen_statem` monitors). Populates the
+  `PRuntime.Specs` subscription table that the fan-out reads, so observed events are mirrored to
+  the spec from the moment it has started.
+  """
+  @spec observes(machine(), [atom()]) :: :ok
+  def observes(spec_id, events), do: PRuntime.Specs.register(spec_id, events)
+
   # ---- creation (P `new MachineName(args)`) ----
 
   @doc """
@@ -56,6 +71,25 @@ defmodule PRuntime do
   @doc "Record that `machine` dequeued `event` while in `state`."
   @spec dequeued(machine(), atom(), atom()) :: :ok
   def dequeued(machine, state, event), do: Trace.record({:dequeue, machine, state, event})
+
+  @doc """
+  Check a P `assert`: succeed if `condition` holds, otherwise raise a `PRuntime.SafetyViolation`.
+
+  P `assert` is a safety check usable in machines and specs alike, so all generated `assert`s route
+  here rather than emitting a bare `raise`. On failure the violation is recorded to the trace and
+  logged at `:error` *before* raising, so it is visible even where the raise is swallowed (e.g. the
+  spec fan-out flush deliberately does not let a violating monitor cascade into the sender). `message`
+  is the assertion message the compiler built, already prefixed with the P source location.
+  """
+  @spec assert(machine(), boolean(), String.t()) :: :ok
+  def assert(_machine, true, _message), do: :ok
+
+  def assert(machine, _condition, message) do
+    Trace.record({:assert_failed, machine, message})
+    require Logger
+    Logger.error("P safety violation in #{inspect(machine)}: #{message}")
+    raise PRuntime.SafetyViolation, machine: machine, message: message
+  end
 
   # ---- transitions: build the :gen_statem return AND log it ----
 
@@ -151,11 +185,31 @@ defmodule PRuntime do
   def send_event(from, target, name, payload \\ nil) do
     Trace.record({:send, from, target, name})
 
+    # Spec monitors are notified at send time, *before* the event is enqueued to the target —
+    # matching the C# runtime, where SendEvent announces to monitors first (DESIGN.md Q2).
+    PRuntime.Specs.notify(from, name, payload)
+
     case resolve(target) do
       {:ok, pid} -> :gen_statem.cast(pid, {:p_event, name, payload})
       :halted -> Trace.record({:send_to_halted, from, target, name})
     end
 
+    :ok
+  end
+
+  # ---- announce (P `announce E, payload`) ----
+
+  @doc """
+  Broadcast `event` (with optional `payload`) to every spec observing it.
+
+  P's `announce` notifies monitors only — it never targets a machine. Like `send_event/4`, fan-out
+  is synchronous (see `PRuntime.Specs`): this returns once every observing spec has handled the
+  event. Specs that do not observe `event` see nothing.
+  """
+  @spec announce(machine(), atom(), term()) :: :ok
+  def announce(from, event, payload \\ nil) do
+    Trace.record({:announce, from, event})
+    PRuntime.Specs.notify(from, event, payload)
     :ok
   end
 
