@@ -108,6 +108,7 @@ defmodule PRuntime do
   def terminated(_machine, _state, {:shutdown, _}), do: :ok
   def terminated(_machine, _state, {%PRuntime.SafetyViolation{}, _stack}), do: :ok
   def terminated(_machine, _state, {%PRuntime.UnhandledEvent{}, _stack}), do: :ok
+  def terminated(_machine, _state, {%PRuntime.DynamicError{}, _stack}), do: :ok
 
   def terminated(machine, state, reason) do
     Trace.record({:crash, machine, state, reason})
@@ -133,6 +134,121 @@ defmodule PRuntime do
     require Logger
     Logger.error("P safety violation in #{inspect(machine)}: #{message}")
     raise PRuntime.SafetyViolation, machine: machine, message: message
+  end
+
+  # ---- collection access (enforce P's index/key rules) ----
+  #
+  # P defines runtime error cases for collection access that the permissive Elixir built-ins do not
+  # signal: `Map.get` returns nil on a missing key, `Enum.at` returns nil out of range, and
+  # `List.insert_at`/`replace_at`/`delete_at` clamp an out-of-range index. Generated code routes
+  # collection reads/writes through these helpers so a P dynamic error aborts the machine via
+  # `dynamic_error/2` (mirroring the C# runtime) instead of limping on with a wrong value.
+
+  @doc """
+  Read element `index` of sequence `seq` (P `seq[index]`).
+
+  P requires `0 <= index < sizeof(seq)`; an out-of-range index is a dynamic error (not `nil`, the way
+  `Enum.at/2` would yield — it even counts a negative index from the end, which P never means).
+  """
+  @spec seq_get(machine(), list(), integer()) :: term()
+  def seq_get(machine, seq, index) do
+    if is_integer(index) and index >= 0 and index < length(seq) do
+      Enum.at(seq, index)
+    else
+      dynamic_error(machine, "sequence index #{inspect(index)} out of range 0..#{length(seq) - 1}")
+    end
+  end
+
+  @doc """
+  Read element `index` of set `set` (P `set[index]`).
+
+  A P set is indexable (in its internal order); P requires `0 <= index < sizeof(set)`. An
+  out-of-range index is a dynamic error.
+  """
+  @spec set_get(machine(), MapSet.t(), integer()) :: term()
+  def set_get(machine, set, index) do
+    size = MapSet.size(set)
+
+    if is_integer(index) and index >= 0 and index < size do
+      Enum.at(MapSet.to_list(set), index)
+    else
+      dynamic_error(machine, "set index #{inspect(index)} out of range 0..#{size - 1}")
+    end
+  end
+
+  @doc """
+  Look up `key` in map `m` (P `m[key]`).
+
+  P requires the key to be present; a missing key is a dynamic error rather than the `nil` that
+  `Map.get/2` would return and let the program continue with.
+  """
+  @spec map_get(machine(), map(), term()) :: term()
+  def map_get(machine, m, key) do
+    case Map.fetch(m, key) do
+      {:ok, value} -> value
+      :error -> dynamic_error(machine, "map key #{inspect(key)} not found")
+    end
+  end
+
+  @doc """
+  Replace element `index` of sequence `seq` with `value` (P `seq[index] = value`).
+
+  P requires `0 <= index < sizeof(seq)`; an out-of-range index is a dynamic error rather than the
+  silent no-op `List.replace_at/3` performs.
+  """
+  @spec seq_set(machine(), list(), integer(), term()) :: list()
+  def seq_set(machine, seq, index, value) do
+    if is_integer(index) and index >= 0 and index < length(seq) do
+      List.replace_at(seq, index, value)
+    else
+      dynamic_error(machine, "sequence index #{inspect(index)} out of range 0..#{length(seq) - 1}")
+    end
+  end
+
+  @doc """
+  Insert `value` into sequence `seq` at `index` (P `seq += (index, value)`).
+
+  P allows `0 <= index <= sizeof(seq)` (index `sizeof` appends); anything else is a dynamic error
+  rather than the clamping `List.insert_at/3` does (a negative index counts from the end, an index
+  past the end appends).
+  """
+  @spec seq_insert(machine(), list(), integer(), term()) :: list()
+  def seq_insert(machine, seq, index, value) do
+    if is_integer(index) and index >= 0 and index <= length(seq) do
+      List.insert_at(seq, index, value)
+    else
+      dynamic_error(machine, "sequence insert index #{inspect(index)} out of range 0..#{length(seq)}")
+    end
+  end
+
+  @doc """
+  Remove element `index` from sequence `seq` (P `seq -= (index)`).
+
+  P requires `0 <= index < sizeof(seq)`; an out-of-range index is a dynamic error rather than the
+  silent no-op `List.delete_at/2` performs.
+  """
+  @spec seq_remove(machine(), list(), integer()) :: list()
+  def seq_remove(machine, seq, index) do
+    if is_integer(index) and index >= 0 and index < length(seq) do
+      List.delete_at(seq, index)
+    else
+      dynamic_error(machine, "sequence remove index #{inspect(index)} out of range 0..#{length(seq) - 1}")
+    end
+  end
+
+  @doc """
+  Report a P dynamic error (out-of-range collection index or missing map key) on `machine`.
+
+  Records the error to the trace and logs it at `:error` *before* raising `PRuntime.DynamicError`, so
+  it stays visible even where the raise is later swallowed — mirroring `assert/3` and
+  `unhandled_event/3`. Never returns.
+  """
+  @spec dynamic_error(machine(), String.t()) :: no_return()
+  def dynamic_error(machine, message) do
+    Trace.record({:dynamic_error, machine, message})
+    require Logger
+    Logger.error("P dynamic error in #{inspect(machine)}: #{message}")
+    raise PRuntime.DynamicError, machine: machine, message: message
   end
 
   # ---- transitions: build the :gen_statem return AND log it ----
